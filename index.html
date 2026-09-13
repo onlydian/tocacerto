@@ -624,9 +624,30 @@
     return stripDiacritics((s||'').toLowerCase()).replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim();
   }
 
+  // Remove sufixos/parênteses comuns que fazem o nome da faixa do Spotify
+  // e o nome retornado pelo iTunes não baterem mesmo sendo a mesma música
+  // (ex.: "Fico Assim Sem Você - Ao Vivo" vs "Fico Assim Sem Você").
+  function stripVersionNoise(s){
+    return s
+      .replace(/\([^)]*\)/g, ' ')
+      .replace(/\[[^\]]*\]/g, ' ')
+      .replace(/-\s*(ao vivo|live|remaster(ed)?( \d{4})?|radio edit|single version|mono|stereo|feat\.?.*|with .*)$/i, ' ')
+      .trim();
+  }
+
+  // O iTunes só entrega o(s) artista(s) principal(is) em "artistName", então
+  // comparamos cada artista do Spotify (separados por vírgula) contra ele,
+  // aceitando também o caso comum de "Fulano & Ciclano".
+  function artistMatches(wantArtistRaw, resultArtistRaw){
+    const ra = normalizeLoose(resultArtistRaw);
+    if (!ra) return false;
+    const wantArtists = wantArtistRaw.split(/,|&| e /i).map(a => normalizeLoose(a)).filter(Boolean);
+    return wantArtists.some(a => a.length > 1 && (ra.includes(a) || a.includes(ra)));
+  }
+
   async function findItunesPreview(track){
     const term = encodeURIComponent(`${track.artist} ${track.name}`);
-    const url = `https://itunes.apple.com/search?term=${term}&media=music&entity=song&limit=5&country=BR`;
+    const url = `https://itunes.apple.com/search?term=${term}&media=music&entity=song&limit=10&country=BR`;
     let res;
     try {
       res = await itunesFetch(url);
@@ -639,10 +660,25 @@
     try { data = await res.json(); } catch(e){ return { previewUrl: null, networkError: true }; }
     if (!data.results || data.results.length === 0) return { previewUrl: null, networkError: false };
 
-    const wantName = normalizeLoose(track.name);
-    let best = data.results.find(r => r.previewUrl && normalizeLoose(r.trackName) === wantName);
-    if (!best) best = data.results.find(r => r.previewUrl && normalizeLoose(r.trackName).includes(wantName));
-    if (!best) best = data.results.find(r => r.previewUrl);
+    const wantName = normalizeLoose(stripVersionNoise(track.name));
+    const withPreview = data.results.filter(r => r.previewUrl);
+
+    // 1) nome igual + artista bate
+    let best = withPreview.find(r =>
+      normalizeLoose(stripVersionNoise(r.trackName)) === wantName && artistMatches(track.artist, r.artistName));
+    // 2) nome "contém" o outro + artista bate (cobre "- Ao Vivo", "(Remix)" etc. que sobrou)
+    if (!best) best = withPreview.find(r => {
+      const rn = normalizeLoose(stripVersionNoise(r.trackName));
+      return (rn.includes(wantName) || wantName.includes(rn)) && artistMatches(track.artist, r.artistName);
+    });
+    // 3) mesmo artista, qualquer título — melhor que uma música totalmente
+    //    diferente, mas ainda assim exigimos que seja o mesmo artista
+    if (!best) best = withPreview.find(r => artistMatches(track.artist, r.artistName));
+
+    // Removemos de propósito o fallback antigo de "pega qualquer prévia":
+    // ele às vezes trazia covers, karaokê ou músicas de outro artista sem
+    // nenhuma relação com a faixa original, deixando o áudio "muito
+    // diferente" do Spotify. Preferimos não achar prévia a achar errado.
     return { previewUrl: best ? best.previewUrl : null, networkError: false };
   }
 
